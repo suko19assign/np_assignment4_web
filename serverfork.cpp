@@ -25,6 +25,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <algorithm>
 
 constexpr size_t BUF_SZ = 4096;
 constexpr int    BACKLOG = 128;
