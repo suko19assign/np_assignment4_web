@@ -1,10 +1,25 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <signal.h>
-#include <unistd.h>
-#include <sys/time.h>
+/*  A very small threaded web server
+ *  
+ *  API identical to serverfork.cpp, but each client is served
+ *  by a detached std::thread instead of fork().
+ */
 
-/* You will to add includes here */
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <sys/sendfile.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
 
 constexpr size_t BUF_SZ = 4096;
 constexpr int    BACKLOG = 128;
@@ -42,17 +57,64 @@ static void send_file(int cfd, int ffd, size_t len, bool body) {
     }
 }
 
-using namespace std;
+static void client_worker(int cfd) {
+    char buf[BUF_SZ] = {0};
+    ssize_t n = recv(cfd, buf, sizeof(buf)-1, 0);
+    if (n <= 0) { close(cfd); return; }
+    auto [method,url] = parse_req(buf);
 
-int main(int argc, char *argv[]){
-  
-  /* Do more magic */
-
-
-  
-  printf("done.\n");
-  return(0);
-
-
-  
+    if (method != "GET" && method != "HEAD") {
+        send(cfd, STATUS_405, strlen(STATUS_405), 0);
+        close(cfd); return;
+    }
+    if (url.empty() || url[0] != '/' || !safe_path(url)) {
+        send(cfd, STATUS_400, strlen(STATUS_400), 0);
+        close(cfd); return;
+    }
+    std::string path = "." + (url == "/" ? "/index.html" : url);
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        send(cfd, STATUS_404, strlen(STATUS_404), 0);
+        close(cfd); return;
+    }
+    struct stat st{};
+    fstat(fd,&st);
+    send_file(cfd,fd,st.st_size,method=="GET");
+    close(fd);
+    close(cfd);
 }
+
+/* ───────────────── entry ───────────────── */
+
+int main(int argc,char *argv[]) {
+    if (argc!=3) {
+        std::cerr<<"Usage: "<<argv[0]<<" <IP> <PORT>\n"; return 1;
+    }
+    const char *host=argv[1], *port=argv[2];
+    addrinfo hints{},*res;
+    hints.ai_family=AF_UNSPEC;
+    hints.ai_socktype=SOCK_STREAM;
+    hints.ai_flags=AI_PASSIVE;
+
+    if (getaddrinfo(host,port,&hints,&res)!=0){perror("getaddrinfo");return 1;}
+
+    int srv=-1;
+    for(auto *p=res;p;p=p->ai_next){
+        srv=socket(p->ai_family,p->ai_socktype,p->ai_protocol);
+        if (srv<0) continue;
+        int yes=1; setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof yes);
+        if (bind(srv,p->ai_addr,p->ai_addrlen)==0) break;
+        close(srv); srv=-1;
+    }
+    freeaddrinfo(res);
+    if (srv<0){perror("bind");return 1;}
+    if (listen(srv,BACKLOG)<0){perror("listen");return 1;}
+
+    while(true){
+        sockaddr_storage cs{}; socklen_t clen=sizeof cs;
+        int cfd=accept(srv,(sockaddr*)&cs,&clen);
+        if (cfd<0){perror("accept");continue;}
+        std::thread(client_worker,cfd).detach();
+    }
+}
+
