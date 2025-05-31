@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <sys/time.h>
 
 #include <cstring>
 #include <iostream>
@@ -29,6 +30,7 @@
 
 constexpr size_t BUF_SZ = 4096;
 constexpr int    BACKLOG = 128;
+constexpr size_t HDR_LIMIT = 8192;
 
 static const char *STATUS_200 =
     "HTTP/1.1 200 OK\r\nConnection: close\r\n";
@@ -39,10 +41,7 @@ static const char *STATUS_405 =
 static const char *STATUS_400 =
     "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
-/* helpers */
-
 static bool safe_path(const std::string &u) {
-    /* Reject: more than one '/' after the leading slash, or any “..” */
     if (u.find("..") != std::string::npos) return false;
     size_t slash_cnt = std::count(u.begin(), u.end(), '/');
     return slash_cnt <= 1;
@@ -61,21 +60,29 @@ static void send_file(int client_fd, int file_fd, size_t length, bool body) {
         << "Content-Length: " << length << "\r\n\r\n";
     std::string h = hdr.str();
     send(client_fd, h.c_str(), h.size(), 0);
-
     if (body && length) {
         off_t offset = 0;
         while (offset < static_cast<off_t>(length))
-            offset += sendfile(client_fd, file_fd, &offset,
-                               length - offset);
+            offset += sendfile(client_fd, file_fd, &offset, length - offset);
     }
 }
 
 static void handle_client(int client_fd) {
-    char buf[BUF_SZ] = {0};
-    ssize_t r = recv(client_fd, buf, sizeof(buf)-1, 0);
-    if (r <= 0) { close(client_fd); return; }
-
-    auto [method, url] = parse_req(buf);
+    timeval tv{15,0};
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    std::string req;
+    char buf[BUF_SZ];
+    while (req.find("\r\n\r\n") == std::string::npos) {
+        ssize_t r = recv(client_fd, buf, sizeof(buf), 0);
+        if (r <= 0) { close(client_fd); return; }
+        req.append(buf, r);
+        if (req.size() > HDR_LIMIT) {
+            send(client_fd, STATUS_400, strlen(STATUS_400), 0);
+            close(client_fd);
+            return;
+        }
+    }
+    auto [method, url] = parse_req(req.c_str());
     if (method != "GET" && method != "HEAD") {
         send(client_fd, STATUS_405, strlen(STATUS_405), 0);
         close(client_fd);
@@ -100,26 +107,43 @@ static void handle_client(int client_fd) {
     close(client_fd);
 }
 
-/*  entry point  */
-
 int main(int argc, char *argv[]) {
-    if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <IP> <PORT>\n";
+    std::string host_str, port_str;
+    if (argc == 3) {
+        host_str = argv[1];
+        port_str = argv[2];
+    } else if (argc == 2) {
+        std::string hp = argv[1];
+        size_t pos = std::string::npos;
+        if (!hp.empty() && hp[0] == '[') {
+            size_t close_br = hp.find(']');
+            if (close_br != std::string::npos && close_br + 1 < hp.size() && hp[close_br + 1] == ':')
+                pos = close_br + 1;
+        }
+        if (pos == std::string::npos) pos = hp.rfind(':');
+        if (pos == std::string::npos) {
+            std::cerr << "Usage: " << argv[0] << " <IP:PORT> or <IP> <PORT>\n";
+            return 1;
+        }
+        host_str = hp.substr(0, pos);
+        if (!host_str.empty() && host_str.front() == '[' && host_str.back() == ']')
+            host_str = host_str.substr(1, host_str.size() - 2);
+        port_str = hp.substr(pos + 1);
+    } else {
+        std::cerr << "Usage: " << argv[0] << " <IP:PORT> or <IP> <PORT>\n";
         return 1;
     }
-    const char *host = argv[1];
-    const char *port = argv[2];
+    const char *host = host_str.empty() ? nullptr : host_str.c_str();
+    const char *port = port_str.c_str();
 
     addrinfo hints{}, *res;
-    hints.ai_family   = AF_UNSPEC;      // v4 or v6
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags    = AI_PASSIVE;
-
+    hints.ai_flags = AI_PASSIVE;
     if (getaddrinfo(host, port, &hints, &res) != 0) {
         perror("getaddrinfo");
         return 1;
     }
-
     int srv = -1;
     for (auto *p = res; p; p = p->ai_next) {
         srv = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
@@ -131,24 +155,21 @@ int main(int argc, char *argv[]) {
     }
     freeaddrinfo(res);
     if (srv < 0) { perror("bind"); return 1; }
-
     if (listen(srv, BACKLOG) < 0) { perror("listen"); return 1; }
 
-    signal(SIGCHLD, SIG_IGN);   // auto-reap children
-
+    signal(SIGCHLD, SIG_IGN);
     while (true) {
         sockaddr_storage caddr{};
         socklen_t clen = sizeof caddr;
-        int cfd = accept(srv, (sockaddr*)&caddr, &clen);
+        int cfd = accept(srv, (sockaddr *)&caddr, &clen);
         if (cfd < 0) { perror("accept"); continue; }
-
         pid_t pid = fork();
-        if (pid == 0) {      // child
+        if (pid == 0) {
             close(srv);
             handle_client(cfd);
             _exit(0);
         }
-        close(cfd);          // parent – first copy closed
+        close(cfd);
     }
 }
 
